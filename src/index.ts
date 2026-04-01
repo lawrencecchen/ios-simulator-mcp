@@ -75,6 +75,39 @@ async function idb(...args: string[]) {
   return run(getIdbPath(), args);
 }
 
+/**
+ * Runs an idb UI command with automatic retry on cold-start empty results.
+ * IDB lazily connects to testmanagerd; the first call after boot (or reboot)
+ * often returns an empty accessibility tree. This wrapper detects that sentinel
+ * and retries once after a short delay.
+ */
+async function idbUIWithRetry(...args: string[]) {
+  const result = await idb(...args);
+
+  // Detect cold-start empty result: single root element with zero-dimension frame
+  if (args[0] === "ui" && (args[1] === "describe-all" || args[1] === "describe-point")) {
+    try {
+      const parsed = JSON.parse(result.stdout);
+      const root = Array.isArray(parsed) ? parsed[0] : parsed;
+      const frame = root?.frame;
+      if (
+        frame &&
+        frame.width === 0 &&
+        frame.height === 0 &&
+        (!root.type || root.type === "None" || root.type === null)
+      ) {
+        // Cold start detected, wait and retry
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        return idb(...args);
+      }
+    } catch {
+      // Parse failed, return original result
+    }
+  }
+
+  return result;
+}
+
 // Read filtered tools from environment variable
 const FILTERED_TOOLS =
   process.env.IOS_SIMULATOR_MCP_FILTERED_TOOLS?.split(",").map((tool) =>
@@ -189,7 +222,7 @@ async function nativeTap(
   const deviceName = await getDeviceName(deviceId);
 
   // Get device screen dimensions in iOS points
-  const { stdout: describeOutput } = await idb(
+  const { stdout: describeOutput } = await idbUIWithRetry(
     "ui",
     "describe-all",
     "--udid",
@@ -448,7 +481,7 @@ if (!isToolFiltered("ui_describe_all")) {
       try {
         const actualUdid = await getBootedDeviceId(udid);
 
-        const { stdout } = await idb(
+        const { stdout } = await idbUIWithRetry(
           "ui",
           "describe-all",
           "--udid",
@@ -782,7 +815,7 @@ if (!isToolFiltered("ui_describe_point")) {
       try {
         const actualUdid = await getBootedDeviceId(udid);
 
-        const { stdout, stderr } = await idb(
+        const { stdout, stderr } = await idbUIWithRetry(
           "ui",
           "describe-point",
           "--udid",
@@ -836,7 +869,7 @@ if (!isToolFiltered("ui_view")) {
         const actualUdid = await getBootedDeviceId(udid);
 
         // Get screen dimensions in points from ui_describe_all
-        const { stdout: uiDescribeOutput } = await idb(
+        const { stdout: uiDescribeOutput } = await idbUIWithRetry(
           "ui",
           "describe-all",
           "--udid",
