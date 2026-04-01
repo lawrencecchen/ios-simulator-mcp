@@ -96,8 +96,8 @@ async function idbUIWithRetry(...args: string[]) {
         frame.height === 0 &&
         (!root.type || root.type === "None" || root.type === null)
       ) {
-        // Cold start detected, wait and retry
-        await new Promise((resolve) => setTimeout(resolve, 1500));
+        // Cold start detected, wait and retry (2.5s needed for testmanagerd handshake)
+        await new Promise((resolve) => setTimeout(resolve, 2500));
         return idb(...args);
       }
     } catch {
