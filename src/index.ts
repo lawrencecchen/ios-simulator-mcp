@@ -153,6 +153,163 @@ async function getBootedDeviceId(
   return actualDeviceId;
 }
 
+/**
+ * Gets the device name for a given UDID from simctl
+ */
+async function getDeviceName(deviceId: string): Promise<string> {
+  const { stdout } = await run("xcrun", ["simctl", "list", "devices", "-j"]);
+  const devicesJson = JSON.parse(stdout);
+  for (const [, devices] of Object.entries(devicesJson.devices)) {
+    for (const device of devices as any[]) {
+      if (device.udid === deviceId) {
+        return device.name;
+      }
+    }
+  }
+  throw new Error(`Device with UDID ${deviceId} not found in simctl list`);
+}
+
+/**
+ * Performs a tap on the iOS Simulator by injecting a CGEvent mouse click at the
+ * corresponding macOS screen coordinates. This bypasses IDB and works for UI
+ * elements that IDB cannot reach, such as inputAccessoryView buttons.
+ *
+ * Steps:
+ * 1. Find the Simulator window for the target device by name
+ * 2. Find the device screen content area within the window via accessibility
+ * 3. Map iOS point coordinates to macOS screen coordinates
+ * 4. Post CGEvent mouse down/up at the calculated position
+ */
+async function nativeTap(
+  deviceId: string,
+  iosX: number,
+  iosY: number,
+  duration?: number
+): Promise<{ screenX: number; screenY: number; scale: number }> {
+  const deviceName = await getDeviceName(deviceId);
+
+  // Get device screen dimensions in iOS points
+  const { stdout: describeOutput } = await idb(
+    "ui",
+    "describe-all",
+    "--udid",
+    deviceId,
+    "--json",
+    "--nested"
+  );
+  const uiData = JSON.parse(describeOutput);
+  const screenFrame = uiData[0]?.frame;
+  if (!screenFrame) {
+    throw new Error("Could not determine device screen dimensions from IDB");
+  }
+  const deviceW = screenFrame.width;
+  const deviceH = screenFrame.height;
+
+  const clickDuration = duration ?? 0.05;
+
+  // Use JXA to find window, calculate coordinates, and click via CGEvent
+  const jxaScript = `
+(function() {
+  ObjC.import("CoreGraphics");
+
+  var deviceName = ${JSON.stringify(deviceName)};
+  var iosX = ${iosX};
+  var iosY = ${iosY};
+  var deviceW = ${deviceW};
+  var deviceH = ${deviceH};
+  var clickDuration = ${clickDuration};
+
+  // Find the Simulator window for this device
+  var se = Application("System Events");
+  var sim = se.processes.byName("Simulator");
+  var wins = sim.windows();
+  var targetWindow = null;
+  for (var i = 0; i < wins.length; i++) {
+    try {
+      if (wins[i].name().includes(deviceName)) {
+        targetWindow = wins[i];
+        break;
+      }
+    } catch(e) {}
+  }
+  if (!targetWindow) {
+    throw new Error("No Simulator window found for device: " + deviceName);
+  }
+
+  // Bring window to front
+  var actions = targetWindow.actions();
+  for (var i = 0; i < actions.length; i++) {
+    if (actions[i].name() === "AXRaise") {
+      actions[i].perform();
+      break;
+    }
+  }
+  Application("Simulator").activate();
+  delay(0.2);
+
+  // Find the device screen content area by looking for the AXGroup
+  // whose size matches the device screen dimensions (or is proportional)
+  var uiElems = targetWindow.uiElements();
+  var contentX = -1, contentY = -1, contentW = -1, contentH = -1;
+  for (var i = 0; i < uiElems.length; i++) {
+    try {
+      var role = uiElems[i].role();
+      if (role !== "AXGroup") continue;
+      var pos = uiElems[i].position();
+      var size = uiElems[i].size();
+      // Check if this group's aspect ratio matches the device screen
+      var groupAR = size[0] / size[1];
+      var deviceAR = deviceW / deviceH;
+      if (Math.abs(groupAR - deviceAR) < 0.01) {
+        contentX = pos[0];
+        contentY = pos[1];
+        contentW = size[0];
+        contentH = size[1];
+        break;
+      }
+    } catch(e) {}
+  }
+
+  if (contentX < 0) {
+    throw new Error("Could not find device screen content area in Simulator window");
+  }
+
+  // Calculate scale and map coordinates
+  var scaleX = contentW / deviceW;
+  var scaleY = contentH / deviceH;
+  var scale = scaleX; // Should be equal to scaleY given matching aspect ratio
+
+  var screenX = contentX + (iosX * scale);
+  var screenY = contentY + (iosY * scale);
+
+  // Post CGEvent mouse click
+  var point = $.CGPointMake(screenX, screenY);
+  var mouseDown = $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseDown, point, 0);
+  var mouseUp = $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseUp, point, 0);
+
+  $.CGEventPost($.kCGHIDEventTap, mouseDown);
+  delay(clickDuration);
+  $.CGEventPost($.kCGHIDEventTap, mouseUp);
+
+  return JSON.stringify({
+    screenX: screenX,
+    screenY: screenY,
+    scale: scale,
+    contentOrigin: { x: contentX, y: contentY },
+    contentSize: { w: contentW, h: contentH }
+  });
+})();
+`;
+
+  const { stdout } = await run("osascript", ["-l", "JavaScript", "-e", jxaScript]);
+  const result = JSON.parse(stdout);
+  return {
+    screenX: result.screenX,
+    screenY: result.screenY,
+    scale: result.scale,
+  };
+}
+
 // Register tools only if they're not filtered
 if (!isToolFiltered("get_booted_sim_id")) {
   server.tool(
@@ -224,10 +381,61 @@ if (!isToolFiltered("open_simulator")) {
   );
 }
 
+/**
+ * Probes an area using idb describe-point to discover elements not returned by
+ * describe-all (e.g. inputAccessoryView toolbar buttons). Scans horizontally
+ * across the area at the vertical midpoint, stepping by stepSize points.
+ */
+async function probeAreaForHiddenElements(
+  udid: string,
+  frame: { x: number; y: number; width: number; height: number },
+  stepSize: number = 20
+): Promise<any[]> {
+  const midY = Math.round(frame.y + frame.height / 2);
+  const discovered = new Map<string, any>();
+
+  for (let x = Math.round(frame.x + 5); x < frame.x + frame.width - 5; x += stepSize) {
+    try {
+      const { stdout } = await idb(
+        "ui",
+        "describe-point",
+        "--udid",
+        udid,
+        "--json",
+        "--",
+        String(x),
+        String(midY)
+      );
+      const element = JSON.parse(stdout);
+      // Use AXUniqueId or frame as dedup key
+      const key =
+        element.AXUniqueId ||
+        `${element.frame?.x}_${element.frame?.y}_${element.frame?.width}_${element.frame?.height}`;
+      if (key && !discovered.has(key)) {
+        // Skip if this is the parent group itself
+        const ef = element.frame;
+        if (
+          ef &&
+          Math.abs(ef.x - frame.x) < 1 &&
+          Math.abs(ef.y - frame.y) < 1 &&
+          Math.abs(ef.width - frame.width) < 1
+        ) {
+          continue;
+        }
+        discovered.set(key, element);
+      }
+    } catch {
+      // describe-point can fail for coordinates outside the screen
+    }
+  }
+
+  return Array.from(discovered.values());
+}
+
 if (!isToolFiltered("ui_describe_all")) {
   server.tool(
     "ui_describe_all",
-    "Describes accessibility information for the entire screen in the iOS Simulator",
+    "Describes accessibility information for the entire screen in the iOS Simulator. Automatically discovers elements in inputAccessoryView toolbars that IDB's describe-all normally misses.",
     {
       udid: z
         .string()
@@ -249,9 +457,80 @@ if (!isToolFiltered("ui_describe_all")) {
           "--nested"
         );
 
+        const elements = JSON.parse(stdout);
+
+        // Find toolbar/group elements with no children and probe them
+        // for hidden elements (e.g. inputAccessoryView buttons)
+        const toolbarGroups: { x: number; y: number; width: number; height: number }[] = [];
+        function findEmptyToolbars(items: any[]) {
+          for (const item of items) {
+            const label = (item.AXLabel || "").toLowerCase();
+            const role = item.role || "";
+            const children = item.children || [];
+            const frame = item.frame;
+
+            if (
+              frame &&
+              (label.includes("toolbar") || role === "AXToolbar") &&
+              children.length === 0 &&
+              frame.width > 50 &&
+              frame.height > 20
+            ) {
+              toolbarGroups.push(frame);
+            }
+
+            if (children.length > 0) {
+              findEmptyToolbars(children);
+            }
+          }
+        }
+        findEmptyToolbars(elements);
+
+        // Probe each empty toolbar for hidden children
+        if (toolbarGroups.length > 0) {
+          const probeResults = await Promise.all(
+            toolbarGroups.map((frame) =>
+              probeAreaForHiddenElements(actualUdid, frame)
+            )
+          );
+
+          // Add discovered elements to the output
+          for (let i = 0; i < toolbarGroups.length; i++) {
+            const discovered = probeResults[i];
+            if (discovered.length > 0) {
+              // Find the toolbar in the original elements and add children
+              function addChildren(items: any[]): boolean {
+                for (const item of items) {
+                  const f = item.frame;
+                  if (
+                    f &&
+                    Math.abs(f.x - toolbarGroups[i].x) < 1 &&
+                    Math.abs(f.y - toolbarGroups[i].y) < 1
+                  ) {
+                    item.children = discovered;
+                    item._probed = true;
+                    return true;
+                  }
+                  if (item.children && addChildren(item.children)) {
+                    return true;
+                  }
+                }
+                return false;
+              }
+              if (!addChildren(elements)) {
+                // If we can't find the parent, append as top-level
+                for (const elem of discovered) {
+                  elem._probed = true;
+                  elements.push(elem);
+                }
+              }
+            }
+          }
+        }
+
         return {
           isError: false,
-          content: [{ type: "text", text: stdout }],
+          content: [{ type: "text", text: JSON.stringify(elements) }],
         };
       } catch (error) {
         return {
@@ -273,7 +552,7 @@ if (!isToolFiltered("ui_describe_all")) {
 if (!isToolFiltered("ui_tap")) {
   server.tool(
     "ui_tap",
-    "Tap on the screen in the iOS Simulator",
+    "Tap on the screen in the iOS Simulator. Use method 'native' for elements that IDB cannot reach (e.g. inputAccessoryView buttons above the keyboard). Native mode injects a macOS CGEvent click on the Simulator window at the mapped coordinates.",
     {
       duration: z
         .string()
@@ -286,12 +565,37 @@ if (!isToolFiltered("ui_tap")) {
         .optional()
         .describe("Udid of target, can also be set with the IDB_UDID env var"),
       x: z.number().describe("The x-coordinate"),
-      y: z.number().describe("The x-coordinate"),
+      y: z.number().describe("The y-coordinate"),
+      method: z
+        .enum(["idb", "native"])
+        .optional()
+        .default("idb")
+        .describe(
+          "Tap method. 'idb' uses Facebook IDB (default). 'native' injects a macOS CGEvent click on the Simulator window, which can reach UI elements like inputAccessoryView that IDB cannot tap."
+        ),
     },
     { title: "UI Tap", readOnlyHint: false, openWorldHint: true },
-    async ({ duration, udid, x, y }) => {
+    async ({ duration, udid, x, y, method }) => {
       try {
         const actualUdid = await getBootedDeviceId(udid);
+
+        if (method === "native") {
+          const result = await nativeTap(
+            actualUdid,
+            x,
+            y,
+            duration ? parseFloat(duration) : undefined
+          );
+          return {
+            isError: false,
+            content: [
+              {
+                type: "text",
+                text: `Tapped successfully (native) at macOS screen coordinates (${result.screenX.toFixed(1)}, ${result.screenY.toFixed(1)}), scale=${result.scale.toFixed(3)}`,
+              },
+            ],
+          };
+        }
 
         const { stderr } = await idb(
           "ui",
