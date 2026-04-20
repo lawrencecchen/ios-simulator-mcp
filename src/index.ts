@@ -585,7 +585,7 @@ if (!isToolFiltered("ui_describe_all")) {
 if (!isToolFiltered("ui_tap")) {
   server.tool(
     "ui_tap",
-    "Tap on the screen in the iOS Simulator. Use method 'native' for elements that IDB cannot reach (e.g. inputAccessoryView buttons above the keyboard). Native mode injects a macOS CGEvent click on the Simulator window at the mapped coordinates.",
+    "Tap on the screen in the iOS Simulator.",
     {
       duration: z
         .string()
@@ -599,36 +599,11 @@ if (!isToolFiltered("ui_tap")) {
         .describe("Udid of target, can also be set with the IDB_UDID env var"),
       x: z.number().describe("The x-coordinate"),
       y: z.number().describe("The y-coordinate"),
-      method: z
-        .enum(["idb", "native"])
-        .optional()
-        .default("idb")
-        .describe(
-          "Tap method. 'idb' uses Facebook IDB (default). 'native' injects a macOS CGEvent click on the Simulator window, which can reach UI elements like inputAccessoryView that IDB cannot tap."
-        ),
     },
     { title: "UI Tap", readOnlyHint: false, openWorldHint: true },
-    async ({ duration, udid, x, y, method }) => {
+    async ({ duration, udid, x, y }) => {
       try {
         const actualUdid = await getBootedDeviceId(udid);
-
-        if (method === "native") {
-          const result = await nativeTap(
-            actualUdid,
-            x,
-            y,
-            duration ? parseFloat(duration) : undefined
-          );
-          return {
-            isError: false,
-            content: [
-              {
-                type: "text",
-                text: `Tapped successfully (native) at macOS screen coordinates (${result.screenX.toFixed(1)}, ${result.screenY.toFixed(1)}), scale=${result.scale.toFixed(3)}`,
-              },
-            ],
-          };
-        }
 
         const { stderr } = await idb(
           "ui",
